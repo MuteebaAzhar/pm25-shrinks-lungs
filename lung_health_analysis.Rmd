@@ -1,0 +1,786 @@
+---
+title: "Air Quality and Lung Health: A Complete Data Analysis in R"
+subtitle: "Data Analysis Bootcamp, Batch 5, 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 7, fig.height = 4.5,
+                      fig.align = "center")
+library(ggplot2)
+
+# ---- the data file (edit this path if your folder is different) ----
+data_file <- "data/lung_health_study.csv"   # run from the repository root
+if (!file.exists(data_file)) stop("Data file not found. Run scripts/simulate_lung_data.R first.")
+
+theme_set(theme_classic(base_size = 12))
+
+# ---- small helpers used in the text below ----
+pfmt <- function(p) ifelse(p < 0.001, "< 0.001", sprintf("%.3f", p))   # nice p-values
+f2   <- function(x) sprintf("%.2f", x)                                  # 2 decimals
+sig  <- function(p) ifelse(p < 0.05, "significant", "not significant")  # wording
+skew <- function(x) { x <- x[!is.na(x)]; mean((x - mean(x))^3) / sd(x)^3 }
+cohens_d <- function(x, g) {                                            # effect size, 2 groups
+  g <- factor(g); a <- x[g == levels(g)[1]]; b <- x[g == levels(g)[2]]
+  a <- a[!is.na(a)]; b <- b[!is.na(b)]
+  sp <- sqrt(((length(a) - 1) * var(a) + (length(b) - 1) * var(b)) / (length(a) + length(b) - 2))
+  (mean(a) - mean(b)) / sp
+}
+cramers_v <- function(tab) {                                            # effect size, tables
+  chi <- suppressWarnings(chisq.test(tab, correct = FALSE)$statistic)
+  unname(sqrt(chi / (sum(tab) * (min(dim(tab)) - 1))))
+}
+```
+
+# About this analysis
+
+**The story.** A city is worried about air pollution. Researchers surveyed **adults living in four zones** (Industrial, Traffic Hub, Residential and Park). For every person they recorded the dust level where the person lives (**PM2.5**), lifestyle, body measurements and lung health.
+
+**The plan.** We go through the data the way a real analyst does:
+
+1. Load the data and look at it
+2. Fix the data types
+3. Create helpful new variables
+4. Check data quality (missing values, duplicates, impossible values, outliers)
+5. Describe each variable on its own
+6. Check the shape of the data (normal or skewed?)
+7. Compare groups, test links between categories, and measure relationships between numbers
+8. Build models that combine several variables
+9. Summarise the findings
+
+**How to read each test.** Every test starts with a *null hypothesis* (H0: "nothing is going on") and an *alternative hypothesis* (H1: "something is going on"). We use a significance level of **0.05**. If p < 0.05 we reject H0 and call the result *significant*. A small p-value tells us the result is unlikely to be chance. It does **not** tell us the result is large or important, so we also report effect sizes.
+
+# Load the data and take a first look
+
+```{r load}
+d <- read.csv(data_file, stringsAsFactors = FALSE)   # read the CSV file
+d_raw <- d                                           # keep an untouched copy to compare later
+
+dim(d)          # rows and columns
+str(d)          # structure: the type of each variable
+head(d)         # first 6 rows
+```
+
+The file has **`r nrow(d)` people (rows)** and **`r ncol(d)` variables (columns)**. Notice that most text columns are stored as `chr` (character) and the numbers are stored as `num` or `int`. R does not know which text columns are *categories*, which one is a *date*, or which number is only an *ID*. We fix that next.
+
+# Fix the data types
+
+Choosing the right data type matters because R treats each type differently. For example, you can average a number but not a category, and a factor with ordered levels sorts correctly in tables and plots.
+
+| Variable | Now | Should be | Why |
+|---|---|---|---|
+| Participant_ID | number | text (character) | It is a label. We never want to average an ID. |
+| Survey_Date | text | Date | So R can sort dates and extract months. |
+| Zone, Sex, Smoker, Respiratory_Illness | text | factor (category) | They are groups. |
+| Exercise_Level, Mask_Use | text | **ordered** factor | Low < Moderate < High, and Never < Sometimes < Always. |
+| Age, Cough_Days, Resting_HR | decimal number | integer | They are whole numbers (counts or years). |
+| BMI, Sleep_Hours, PM25, Lung_Capacity_L | decimal number | stays numeric | They are measurements. |
+
+```{r convert}
+d$Participant_ID <- as.character(d$Participant_ID)       # an ID is a label, not a number
+d$Survey_Date    <- as.Date(d$Survey_Date)               # text -> date
+
+# categories: we choose the order of the levels ourselves
+d$Zone <- factor(d$Zone, levels = c("Park", "Residential", "Traffic_Hub", "Industrial"))
+d$Sex  <- factor(d$Sex,  levels = c("Female", "Male"))
+d$Smoker <- factor(d$Smoker, levels = c("No", "Yes"))
+d$Respiratory_Illness <- factor(d$Respiratory_Illness, levels = c("No", "Yes"))
+
+# ordered categories: ordered = TRUE tells R that the order has a meaning
+d$Exercise_Level <- factor(d$Exercise_Level, levels = c("Low", "Moderate", "High"), ordered = TRUE)
+d$Mask_Use       <- factor(d$Mask_Use, levels = c("Never", "Sometimes", "Always"), ordered = TRUE)
+
+# whole numbers
+d$Age        <- as.integer(d$Age)
+d$Cough_Days <- as.integer(d$Cough_Days)
+d$Resting_HR <- as.integer(d$Resting_HR)
+
+str(d)
+```
+
+A before-and-after check of all the types:
+
+```{r type-check}
+type_check <- data.frame(
+  Variable = names(d),
+  Before   = sapply(d_raw, function(x) class(x)[1]),
+  After    = sapply(d,     function(x) paste(class(x), collapse = " / ")),
+  row.names = NULL)
+knitr::kable(type_check)
+```
+
+# Create new variables
+
+Sometimes a number is easier to understand in groups. We create four helper variables and keep the original numbers as well.
+
+```{r derive}
+# Age groups
+d$Age_Group <- cut(d$Age, breaks = c(17, 29, 39, 49, 65),
+                   labels = c("18-29", "30-39", "40-49", "50-65"))
+
+# BMI categories (standard cut-offs)
+d$BMI_Category <- cut(d$BMI, breaks = c(0, 18.5, 25, 30, Inf), right = FALSE,
+                      labels = c("Underweight", "Normal", "Overweight", "Obese"))
+
+# Dust level groups (our own cut-offs, in micrograms per cubic metre)
+d$PM25_Level <- cut(d$PM25, breaks = c(0, 50, 100, 150, Inf), right = FALSE,
+                    labels = c("Low (<50)", "Moderate (50-99)", "High (100-149)", "Very high (150+)"))
+
+# Month of the survey (numbers 1-4 turned into names, so it works on any computer language)
+d$Month <- factor(as.integer(format(d$Survey_Date, "%m")), levels = 1:4,
+                  labels = c("Jan", "Feb", "Mar", "Apr"))
+
+knitr::kable(head(d[, c("Age", "Age_Group", "BMI", "BMI_Category", "PM25", "PM25_Level",
+                        "Survey_Date", "Month")]))
+```
+
+# Data quality checks
+
+## Missing values
+
+```{r missing}
+na_count <- colSums(is.na(d))
+na_table <- data.frame(Variable = names(na_count), Missing = na_count,
+                       Percent = round(100 * na_count / nrow(d), 1), row.names = NULL)
+knitr::kable(na_table[na_table$Missing > 0, ])
+```
+
+Only **`Sleep_Hours`** has missing values (`NA`): **`r sum(is.na(d$Sleep_Hours))`** people (`r round(100 * mean(is.na(d$Sleep_Hours)), 1)`%). That is a small share, so we keep the rows and let each test skip the `NA` values. We should still ask whether the missing values are *random* or hide something. A simple check: do the people with missing sleep data look different on another variable?
+
+```{r missing-check}
+d$Sleep_Missing <- ifelse(is.na(d$Sleep_Hours), "Missing", "Reported")
+t_miss <- t.test(Lung_Capacity_L ~ Sleep_Missing, data = d)
+t_miss
+```
+
+The average lung capacity is `r f2(t_miss$estimate[1])` L (missing) and `r f2(t_miss$estimate[2])` L (reported). The difference is **`r sig(t_miss$p.value)`** (p `r ifelse(t_miss$p.value < 0.001, "< 0.001", paste("=", pfmt(t_miss$p.value)))`), so there is `r ifelse(t_miss$p.value < 0.05, "a sign that", "no sign that")` the missing values are linked to lung health. They look like ordinary random gaps.
+
+## Duplicates and impossible values
+
+```{r quality}
+sum(duplicated(d$Participant_ID))          # duplicated IDs
+sum(duplicated(d[, 1:15]))                 # completely duplicated rows
+
+num_vars <- c("Age", "BMI", "Sleep_Hours", "PM25", "Cough_Days", "Resting_HR", "Lung_Capacity_L")
+range_table <- data.frame(Variable = num_vars,
+                          Min = sapply(d[num_vars], min, na.rm = TRUE),
+                          Max = sapply(d[num_vars], max, na.rm = TRUE), row.names = NULL)
+knitr::kable(range_table)
+```
+
+There are no duplicated people. All ranges are possible for living adults: age 18 to 65, BMI `r min(d$BMI)` to `r max(d$BMI)`, sleep `r min(d$Sleep_Hours, na.rm = TRUE)` to `r max(d$Sleep_Hours, na.rm = TRUE)` hours, resting heart rate `r min(d$Resting_HR)` to `r max(d$Resting_HR)` beats per minute, and lung capacity `r min(d$Lung_Capacity_L)` to `r max(d$Lung_Capacity_L)` litres.
+
+## Outliers
+
+We use the common IQR rule: a value is an outlier if it lies more than 1.5 x IQR below the first quartile or above the third quartile.
+
+```{r outliers}
+count_outliers <- function(x) {
+  q <- quantile(x, c(0.25, 0.75), na.rm = TRUE)
+  sum(x < q[1] - 1.5 * diff(q) | x > q[2] + 1.5 * diff(q), na.rm = TRUE)
+}
+outlier_table <- data.frame(Variable = num_vars,
+                            Outliers = sapply(d[num_vars], count_outliers), row.names = NULL)
+outlier_table$Percent <- round(100 * outlier_table$Outliers / nrow(d), 1)
+knitr::kable(outlier_table)
+```
+
+`PM25` has the most outliers (`r outlier_table$Outliers[outlier_table$Variable == "PM25"]` people). These are not errors: some people really live next to heavy pollution. **We keep them**, but we remember that very high values can pull the mean upwards.
+
+# Describe each variable
+
+## Numeric variables
+
+```{r numeric-summary}
+num_summary <- data.frame(
+  Variable = num_vars,
+  n        = sapply(d[num_vars], function(x) sum(!is.na(x))),
+  Mean     = sapply(d[num_vars], mean, na.rm = TRUE),
+  SD       = sapply(d[num_vars], sd, na.rm = TRUE),
+  Median   = sapply(d[num_vars], median, na.rm = TRUE),
+  Q1       = sapply(d[num_vars], quantile, 0.25, na.rm = TRUE),
+  Q3       = sapply(d[num_vars], quantile, 0.75, na.rm = TRUE),
+  Min      = sapply(d[num_vars], min, na.rm = TRUE),
+  Max      = sapply(d[num_vars], max, na.rm = TRUE),
+  Skewness = sapply(d[num_vars], skew),
+  row.names = NULL)
+knitr::kable(num_summary, digits = 2)
+```
+
+How to read the table: if the **mean is bigger than the median** and skewness is clearly above 0, the variable is right-skewed (a few very large values). `PM25` is the clear case: mean `r f2(mean(d$PM25))` versus median `r f2(median(d$PM25))`, skewness `r f2(skew(d$PM25))`. `Cough_Days` is also right-skewed (skewness `r f2(skew(d$Cough_Days))`).
+
+```{r numeric-hist, fig.height=7}
+long_num <- stack(d[num_vars])                       # one column of values, one of variable names
+ggplot(long_num, aes(x = values)) +
+  geom_histogram(bins = 30, fill = "steelblue", colour = "white") +
+  facet_wrap(~ ind, scales = "free", ncol = 3) +
+  labs(title = "Distribution of every numeric variable", x = NULL, y = "Number of people")
+```
+
+Age, BMI, sleep, heart rate and lung capacity look roughly bell-shaped. `PM25` and `Cough_Days` have a long right tail.
+
+## Categorical variables
+
+```{r cat-tables}
+cat_vars <- c("Zone", "Sex", "Smoker", "Exercise_Level", "Mask_Use", "Respiratory_Illness")
+for (v in cat_vars) {
+  cat("\n", v, "\n")
+  print(round(100 * prop.table(table(d[[v]])), 1))   # percent of people in each level
+}
+```
+
+```{r cat-bars, fig.height=6}
+cat_long <- data.frame(Variable = rep(cat_vars, each = nrow(d)),
+                       Level = unlist(lapply(d[cat_vars], as.character)))
+cat_long$Level <- factor(cat_long$Level, levels = unique(cat_long$Level))
+ggplot(cat_long, aes(x = Level)) +
+  geom_bar(fill = "steelblue") +
+  facet_wrap(~ Variable, scales = "free_x", ncol = 3) +
+  labs(title = "Number of people in each category", x = NULL, y = "Number of people") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+- **Smokers** are `r round(100 * mean(d$Smoker == "Yes"), 1)`% of the people, so smoking is a minority group.
+- **Respiratory illness** affected `r round(100 * mean(d$Respiratory_Illness == "Yes"), 1)`% of the people. The outcome is not rare, but the "Yes" group is smaller than the "No" group.
+- The four zones have different sizes; the largest groups are `r paste(names(sort(table(d$Zone), decreasing = TRUE))[1:2], collapse = " and ")`.
+
+# Is the data normal? Skewness and transformation
+
+Many tests (t-test, ANOVA, Pearson correlation) work best when the variable is roughly **bell-shaped**. We check this in two ways: the Shapiro-Wilk test (H0: the data are normal) and a QQ plot (points on the line = normal).
+
+```{r normality}
+shapiro_table <- data.frame(Variable = num_vars,
+  W = sapply(d[num_vars], function(x) shapiro.test(x[!is.na(x)])$statistic),
+  p_value = sapply(d[num_vars], function(x) shapiro.test(x[!is.na(x)])$p.value),
+  Skewness = sapply(d[num_vars], skew), row.names = NULL)
+shapiro_table$p_value <- ifelse(shapiro_table$p_value < 0.001, "< 0.001", sprintf("%.3f", as.numeric(shapiro_table$p_value)))
+knitr::kable(shapiro_table, digits = 3)
+```
+
+**Be careful with large samples.** With `r nrow(d)` people, the Shapiro test notices even tiny departures from normality. So we always look at the plot and the skewness too. The strong skew of `PM25` is a real problem; the other variables are close enough to normal for the usual tests.
+
+A common fix for right-skewed data is the **log transformation**:
+
+```{r log-transform, fig.width=9, fig.height=4}
+d$log_PM25 <- log(d$PM25)
+
+par(mfrow = c(1, 2))
+qqnorm(d$PM25, main = "PM25 (original)", pch = 16, cex = 0.5); qqline(d$PM25, col = "red")
+qqnorm(d$log_PM25, main = "PM25 (log)", pch = 16, cex = 0.5); qqline(d$log_PM25, col = "red")
+par(mfrow = c(1, 1))
+```
+
+The skewness drops from **`r f2(skew(d$PM25))`** (original) to **`r f2(skew(d$log_PM25))`** (log). The log scale is much closer to a bell shape. For `PM25` we will either use tests that do not need normality (Wilcoxon, Kruskal-Wallis, Spearman) or the log version.
+
+# Comparing groups on a number
+
+## Two groups: t-test and Wilcoxon test
+
+**Question.** Do the average values differ between two groups?
+**H0:** the two group means are equal. **H1:** they are different.
+
+We use the Welch t-test (it does not assume equal spread in both groups). Cohen's d is the effect size: about 0.2 is small, 0.5 medium, 0.8 large.
+
+```{r two-groups}
+pairs2 <- data.frame(
+  y = c("Sleep_Hours", "BMI", "Lung_Capacity_L", "Lung_Capacity_L", "Resting_HR"),
+  g = c("Sex",         "Sex", "Smoker",          "Sex",             "Smoker"),
+  stringsAsFactors = FALSE)
+
+two_group_tests <- do.call(rbind, lapply(seq_len(nrow(pairs2)), function(i) {
+  y <- pairs2$y[i]; g <- pairs2$g[i]
+  tt <- t.test(d[[y]] ~ d[[g]])                        # Welch t-test
+  data.frame(Outcome = y, Groups = paste(levels(d[[g]]), collapse = " vs "),
+             Mean_1 = unname(tt$estimate[1]), Mean_2 = unname(tt$estimate[2]),
+             t = unname(tt$statistic), df = unname(tt$parameter),
+             p = tt$p.value, Cohens_d = abs(cohens_d(d[[y]], d[[g]])))
+}))
+show <- two_group_tests
+show$p <- pfmt(show$p)
+knitr::kable(show, digits = 2, row.names = FALSE)
+```
+
+```{r two-group-plots, fig.width=9, fig.height=4}
+p1 <- ggplot(d, aes(Sex, Sleep_Hours, fill = Sex)) + geom_boxplot(show.legend = FALSE) +
+  labs(title = "Sleep by sex", y = "Hours of sleep")
+p2 <- ggplot(d, aes(Smoker, Lung_Capacity_L, fill = Smoker)) + geom_boxplot(show.legend = FALSE) +
+  labs(title = "Lung capacity by smoking", y = "Lung capacity (L)")
+gridExtra_ok <- requireNamespace("gridExtra", quietly = TRUE)
+if (gridExtra_ok) gridExtra::grid.arrange(p1, p2, ncol = 2) else { print(p1); print(p2) }
+```
+
+**Interpretation.**
+
+- **Sleep and sex:** men sleep `r f2(two_group_tests$Mean_2[1])` hours and women `r f2(two_group_tests$Mean_1[1])` hours on average. The difference is **`r sig(two_group_tests$p[1])`** (p `r ifelse(two_group_tests$p[1] < 0.001, "< 0.001", paste("=", pfmt(two_group_tests$p[1])))`, d = `r f2(two_group_tests$Cohens_d[1])`). `r ifelse(two_group_tests$p[1] < 0.05, "", "Men and women sleep about the same.")`
+- **Lung capacity and smoking:** non-smokers have `r f2(two_group_tests$Mean_1[3])` L and smokers `r f2(two_group_tests$Mean_2[3])` L. The difference is **`r sig(two_group_tests$p[3])`** (p `r ifelse(two_group_tests$p[3] < 0.001, "< 0.001", paste("=", pfmt(two_group_tests$p[3])))`, d = `r f2(two_group_tests$Cohens_d[3])`).
+- **A surprise worth noticing:** smoking damages lungs, yet the simple comparison `r ifelse(two_group_tests$p[3] < 0.05, "shows a clear difference", "shows almost no difference")`. The reason is that most smokers are men, and men naturally have bigger lungs, so the two effects hide each other. This is called **confounding**. The regression section below separates them.
+- **Lung capacity and sex:** men have a larger lung capacity than women (`r f2(two_group_tests$Mean_2[4])` vs `r f2(two_group_tests$Mean_1[4])` L, p `r ifelse(two_group_tests$p[4] < 0.001, "< 0.001", paste("=", pfmt(two_group_tests$p[4])))`). This is normal body biology and we must remember it when we build models later.
+- **BMI and sex:** `r sig(two_group_tests$p[2])` (p `r ifelse(two_group_tests$p[2] < 0.001, "< 0.001", paste("=", pfmt(two_group_tests$p[2])))`).
+- **Resting heart rate and smoking:** `r sig(two_group_tests$p[5])` (p `r ifelse(two_group_tests$p[5] < 0.001, "< 0.001", paste("=", pfmt(two_group_tests$p[5])))`).
+
+For skewed variables (`PM25`, `Cough_Days`) the median is a better summary, so we use the **Wilcoxon rank-sum test** (also called the Mann-Whitney test). H0: the two groups have the same distribution.
+
+```{r wilcox}
+w_pm_ill  <- wilcox.test(PM25 ~ Respiratory_Illness, data = d, exact = FALSE)
+w_cough_s <- wilcox.test(Cough_Days ~ Smoker, data = d, exact = FALSE)
+
+wilcox_table <- data.frame(
+  Outcome = c("PM25", "Cough_Days"),
+  Groups  = c("Illness: No vs Yes", "Smoker: No vs Yes"),
+  Median_1 = c(median(d$PM25[d$Respiratory_Illness == "No"]), median(d$Cough_Days[d$Smoker == "No"])),
+  Median_2 = c(median(d$PM25[d$Respiratory_Illness == "Yes"]), median(d$Cough_Days[d$Smoker == "Yes"])),
+  p = pfmt(c(w_pm_ill$p.value, w_cough_s$p.value)))
+knitr::kable(wilcox_table, digits = 1)
+```
+
+People who had a respiratory illness live with higher dust levels (median `r f2(wilcox_table$Median_2[1])` vs `r f2(wilcox_table$Median_1[1])` micrograms per cubic metre, p `r ifelse(w_pm_ill$p.value < 0.001, "< 0.001", paste("=", pfmt(w_pm_ill$p.value)))`). Smokers cough on more days (median `r wilcox_table$Median_2[2]` vs `r wilcox_table$Median_1[2]`, p `r ifelse(w_cough_s$p.value < 0.001, "< 0.001", paste("=", pfmt(w_cough_s$p.value)))`).
+
+## Three or more groups: ANOVA and Kruskal-Wallis
+
+**Question.** Does lung capacity differ between the four zones?
+**H0:** all four zone means are equal. **H1:** at least one zone is different.
+
+```{r anova-zone}
+aov_zone <- aov(Lung_Capacity_L ~ Zone, data = d)
+an <- summary(aov_zone)[[1]]
+F_zone <- an[["F value"]][1]; p_zone <- an[["Pr(>F)"]][1]
+eta2_zone <- an[["Sum Sq"]][1] / sum(an[["Sum Sq"]])           # effect size
+summary(aov_zone)
+
+zone_means <- tapply(d$Lung_Capacity_L, d$Zone, mean)
+round(zone_means, 2)
+
+tuk <- TukeyHSD(aov_zone)$Zone                                  # which zones differ?
+knitr::kable(round(tuk, 3))
+```
+
+```{r anova-assumptions}
+shapiro.test(residuals(aov_zone))      # are the residuals normal?
+bartlett.test(Lung_Capacity_L ~ Zone, data = d)   # equal variances?
+```
+
+```{r anova-plot}
+ggplot(d, aes(Zone, Lung_Capacity_L, fill = Zone)) +
+  geom_boxplot(show.legend = FALSE) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 3, fill = "white") +
+  labs(title = "Lung capacity by zone", subtitle = paste("One-way ANOVA: p", ifelse(p_zone < 0.001, "< 0.001", paste("=", pfmt(p_zone)))),
+       y = "Lung capacity (L)")
+```
+
+**Interpretation.** Lung capacity differs between zones (F = `r f2(F_zone)`, p `r ifelse(p_zone < 0.001, "< 0.001", paste("=", pfmt(p_zone)))`). The zone explains about **`r round(100 * eta2_zone, 1)`%** of the variation in lung capacity (eta-squared = `r f2(eta2_zone)`), which is a small-to-medium effect: zone matters, but age, sex and smoking matter too. The **`r names(which.min(zone_means))`** zone has the lowest average (`r f2(min(zone_means))` L) and **`r names(which.max(zone_means))`** the highest (`r f2(max(zone_means))` L). Tukey's test shows which pairs differ: in the table, a pair with adjusted p ("p adj") below 0.05 is a real difference. The residuals are close to normal and the variances are similar, so ANOVA is a fair choice.
+
+**Dust itself differs by zone too.** Because `PM25` is skewed, we use the Kruskal-Wallis test and pairwise Wilcoxon tests with Holm correction.
+
+```{r kruskal}
+kw_pm <- kruskal.test(PM25 ~ Zone, data = d)
+kw_pm
+pairwise.wilcox.test(d$PM25, d$Zone, p.adjust.method = "holm", exact = FALSE)
+round(tapply(d$PM25, d$Zone, median), 1)
+```
+
+```{r kruskal-plot}
+ggplot(d, aes(Zone, PM25, fill = Zone)) +
+  geom_boxplot(show.legend = FALSE) +
+  labs(title = "Fine dust (PM2.5) by zone", subtitle = paste("Kruskal-Wallis: p", ifelse(kw_pm$p.value < 0.001, "< 0.001", paste("=", pfmt(kw_pm$p.value)))),
+       y = "PM2.5 (micrograms per cubic metre)")
+```
+
+The dust level is clearly different between zones (p `r ifelse(kw_pm$p.value < 0.001, "< 0.001", paste("=", pfmt(kw_pm$p.value)))`). The Industrial zone has the highest median dust (`r round(median(d$PM25[d$Zone == "Industrial"]), 1)`), the Park zone the lowest (`r round(median(d$PM25[d$Zone == "Park"]), 1)`).
+
+**Does exercise lower the resting heart rate?** Exercise level is an ordered category with three levels.
+
+```{r anova-hr}
+aov_hr <- aov(Resting_HR ~ Exercise_Level, data = d)
+an_hr <- summary(aov_hr)[[1]]
+p_hr <- an_hr[["Pr(>F)"]][1]
+summary(aov_hr)
+hr_means <- tapply(d$Resting_HR, d$Exercise_Level, mean)
+round(hr_means, 1)
+round(TukeyHSD(aov_hr)$Exercise_Level, 3)
+
+ggplot(d, aes(Exercise_Level, Resting_HR, fill = Exercise_Level)) +
+  geom_boxplot(show.legend = FALSE) +
+  labs(title = "Resting heart rate by exercise level",
+       subtitle = paste("One-way ANOVA: p", ifelse(p_hr < 0.001, "< 0.001", paste("=", pfmt(p_hr)))),
+       x = "Exercise level", y = "Resting heart rate (beats per minute)")
+```
+
+Yes. The more people exercise, the lower the resting heart rate: `r round(hr_means[1], 1)` (Low), `r round(hr_means[2], 1)` (Moderate) and `r round(hr_means[3], 1)` (High) beats per minute (p `r ifelse(p_hr < 0.001, "< 0.001", paste("=", pfmt(p_hr)))`). The Tukey table shows that all three pairs differ.
+
+# Comparing categories
+
+## Are two categories linked? The chi-square test
+
+**H0:** the two variables are independent (not linked). **H1:** they are linked. The test needs a **table of counts**. Cramer's V is the effect size (about 0.1 small, 0.3 medium, 0.5 large).
+
+### Smoking and respiratory illness
+
+```{r chi-smoke}
+tab_si <- table(d$Smoker, d$Respiratory_Illness)
+tab_si
+round(100 * prop.table(tab_si, 1), 1)         # percent of each smoking group who were ill
+
+chi_si <- chisq.test(tab_si)                  # 2 x 2 table: Yates correction is used
+chi_si
+fisher_si <- fisher.test(tab_si)              # also gives an odds ratio
+fisher_si$estimate; fisher_si$conf.int
+V_si <- cramers_v(tab_si)
+
+ggplot(d, aes(Smoker, fill = Respiratory_Illness)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c(No = "steelblue", Yes = "firebrick")) +
+  labs(title = "Respiratory illness by smoking status",
+       subtitle = paste("Chi-square test: p", ifelse(chi_si$p.value < 0.001, "< 0.001", paste("=", pfmt(chi_si$p.value)))),
+       y = "Proportion of people", fill = "Illness")
+```
+
+Among non-smokers `r round(100 * prop.table(tab_si, 1)["No", "Yes"], 1)`% had a respiratory illness, compared with `r round(100 * prop.table(tab_si, 1)["Yes", "Yes"], 1)`% among smokers. The link is **`r sig(chi_si$p.value)`** (chi-square = `r f2(chi_si$statistic)`, p `r ifelse(chi_si$p.value < 0.001, "< 0.001", paste("=", pfmt(chi_si$p.value)))`, Cramer's V = `r f2(V_si)`). The odds ratio is **`r f2(fisher_si$estimate)`** (95% CI `r f2(fisher_si$conf.int[1])` to `r f2(fisher_si$conf.int[2])`): smokers have about `r f2(fisher_si$estimate)` times the odds of illness.
+
+### Zone and respiratory illness
+
+```{r chi-zone}
+tab_zi <- table(d$Zone, d$Respiratory_Illness)
+round(100 * prop.table(tab_zi, 1), 1)
+chi_zi <- chisq.test(tab_zi)
+chi_zi
+round(chi_zi$stdres, 2)        # standardised residuals: beyond +/-2 = this cell drives the result
+V_zi <- cramers_v(tab_zi)
+
+ggplot(d, aes(Zone, fill = Respiratory_Illness)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c(No = "steelblue", Yes = "firebrick")) +
+  labs(title = "Respiratory illness by zone",
+       subtitle = paste("Chi-square test: p", ifelse(chi_zi$p.value < 0.001, "< 0.001", paste("=", pfmt(chi_zi$p.value)))),
+       y = "Proportion of people", fill = "Illness")
+```
+
+Illness is `r sig(chi_zi$p.value)` linked to the zone (chi-square = `r f2(chi_zi$statistic)`, df = `r chi_zi$parameter`, p `r ifelse(chi_zi$p.value < 0.001, "< 0.001", paste("=", pfmt(chi_zi$p.value)))`, V = `r f2(V_zi)`). The share of ill people is highest in the **`r rownames(tab_zi)[which.max(prop.table(tab_zi, 1)[, "Yes"])]`** zone (`r round(100 * max(prop.table(tab_zi, 1)[, "Yes"]), 1)`%) and lowest in the **`r rownames(tab_zi)[which.min(prop.table(tab_zi, 1)[, "Yes"])]`** zone (`r round(100 * min(prop.table(tab_zi, 1)[, "Yes"]), 1)`%).
+
+### Sex and smoking (a warning about confounding)
+
+```{r chi-sex-smoke}
+tab_ss <- table(d$Sex, d$Smoker)
+round(100 * prop.table(tab_ss, 1), 1)
+chi_ss <- chisq.test(tab_ss)
+chi_ss
+V_ss <- cramers_v(tab_ss)
+```
+
+Smoking is far more common among men (`r round(100 * prop.table(tab_ss, 1)["Male", "Yes"], 1)`%) than among women (`r round(100 * prop.table(tab_ss, 1)["Female", "Yes"], 1)`%): p `r ifelse(chi_ss$p.value < 0.001, "< 0.001", paste("=", pfmt(chi_ss$p.value)))`, V = `r f2(V_ss)`. This matters: sex and smoking are tangled together. If men have smaller lungs than women, is it because they are men or because they smoke more? Simple tests cannot separate the two. **Regression** can, and we do that later.
+
+### Mask use and dust level
+
+```{r chi-mask}
+tab_md <- table(d$PM25_Level, d$Mask_Use)
+tab_md
+chi_md <- chisq.test(tab_md)
+round(chi_md$expected, 1)      # all expected counts should be 5 or more
+chi_md
+```
+
+People living with more dust wear masks more often: the link is **`r sig(chi_md$p.value)`** (p `r ifelse(chi_md$p.value < 0.001, "< 0.001", paste("=", pfmt(chi_md$p.value)))`, V = `r f2(cramers_v(tab_md))`). All expected counts are at least 5, so the chi-square test is valid.
+
+# Relationships between numbers: correlation
+
+**H0:** the correlation (r) is 0. **H1:** r is not 0. The value of r runs from -1 to +1: the sign gives the direction and the size gives the strength (about 0.1 weak, 0.3 moderate, 0.5 strong).
+
+```{r correlation-matrix, fig.height=5.5}
+cm <- cor(d[num_vars], use = "pairwise.complete.obs")      # Pearson correlations
+round(cm, 2)
+
+cm_long <- as.data.frame(as.table(cm)); names(cm_long) <- c("Var1", "Var2", "r")
+ggplot(cm_long, aes(Var1, Var2, fill = r)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.2f", r)), size = 3.2) +
+  scale_fill_gradient2(low = "#B2182B", mid = "white", high = "#2166AC", limits = c(-1, 1)) +
+  labs(title = "Correlation matrix of the numeric variables", x = NULL, y = NULL, fill = "r") +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1))
+```
+
+The strongest relationships (ignoring the diagonal):
+
+```{r top-pairs}
+idx <- which(lower.tri(cm), arr.ind = TRUE)
+pair_table <- data.frame(Variable_1 = rownames(cm)[idx[, 1]], Variable_2 = colnames(cm)[idx[, 2]],
+                         r = cm[idx])
+pair_table <- pair_table[order(-abs(pair_table$r)), ]
+knitr::kable(head(pair_table, 6), digits = 2, row.names = FALSE)
+```
+
+```{r scatter-pm-lung}
+ct_pm <- cor.test(d$PM25, d$Lung_Capacity_L)
+ct_pm
+
+ggplot(d, aes(PM25, Lung_Capacity_L, colour = Zone)) +
+  geom_point(alpha = 0.45, size = 1.4) +
+  geom_smooth(aes(group = 1), method = "lm", colour = "black") +
+  labs(title = "Fine dust and lung capacity",
+       subtitle = paste0("Pearson r = ", f2(ct_pm$estimate), ", p ", ifelse(ct_pm$p.value < 0.001, "< 0.001", paste("=", pfmt(ct_pm$p.value)))),
+       x = "PM2.5 (micrograms per cubic metre)", y = "Lung capacity (L)")
+```
+
+**Interpretation.** More dust goes with smaller lungs: r = **`r f2(ct_pm$estimate)`** (95% CI `r f2(ct_pm$conf.int[1])` to `r f2(ct_pm$conf.int[2])`, p `r ifelse(ct_pm$p.value < 0.001, "< 0.001", paste("=", pfmt(ct_pm$p.value)))`). That is a moderate negative relationship. Squaring r gives R-squared = `r f2(ct_pm$estimate^2)`: dust alone explains about `r round(100 * ct_pm$estimate^2)`% of the differences in lung capacity.
+
+**Pearson or Spearman?** Spearman uses ranks and is safer for skewed variables such as `PM25` and `Cough_Days`.
+
+```{r spearman}
+pairs_cor <- data.frame(x = c("PM25", "PM25", "Age"),
+                        y = c("Lung_Capacity_L", "Cough_Days", "Lung_Capacity_L"),
+                        stringsAsFactors = FALSE)
+cor_compare <- do.call(rbind, lapply(seq_len(nrow(pairs_cor)), function(i) {
+  pe <- cor.test(d[[pairs_cor$x[i]]], d[[pairs_cor$y[i]]])
+  sp <- cor.test(d[[pairs_cor$x[i]]], d[[pairs_cor$y[i]]], method = "spearman", exact = FALSE)
+  data.frame(X = pairs_cor$x[i], Y = pairs_cor$y[i], Pearson_r = unname(pe$estimate),
+             Pearson_p = pfmt(pe$p.value), Spearman_rho = unname(sp$estimate),
+             Spearman_p = pfmt(sp$p.value))
+}))
+knitr::kable(cor_compare, digits = 2)
+```
+
+Both methods agree. Dust is linked to smaller lungs and to more coughing days, and older people have smaller lungs. The Pearson and Spearman values are close, so the skew does not change the story.
+
+**Is the dust effect only a zone effect?** Zones differ in dust *and* in many other ways. If dust really matters, the negative relationship should also appear **inside** each zone.
+
+```{r within-zone}
+within_zone <- do.call(rbind, lapply(levels(d$Zone), function(z) {
+  s <- d[d$Zone == z, ]
+  ct <- cor.test(s$PM25, s$Lung_Capacity_L)
+  data.frame(Zone = z, n = nrow(s), r = unname(ct$estimate), p = pfmt(ct$p.value))
+}))
+knitr::kable(within_zone, digits = 2)
+```
+
+Inside every zone the correlation is `r ifelse(all(within_zone$r < 0), "negative", "mostly negative")` (from `r f2(min(within_zone$r))` to `r f2(max(within_zone$r))`). So the link between dust and lung capacity is not just a difference between zones.
+
+# Two factors together: two-way ANOVA
+
+Two-way ANOVA tests **three** things at once: the effect of factor A, the effect of factor B, and their **interaction** (does the effect of A change depending on B?).
+
+```{r two-way}
+aov2 <- aov(Lung_Capacity_L ~ Sex * Smoker, data = d)
+s2 <- summary(aov2)[[1]]
+rownames(s2) <- trimws(rownames(s2))
+s2
+p2 <- s2[["Pr(>F)"]][1:3]
+
+ggplot(d, aes(Smoker, Lung_Capacity_L, colour = Sex, group = Sex)) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.1) +
+  stat_summary(fun = mean, geom = "point", size = 3) +
+  labs(title = "Lung capacity by sex and smoking",
+       subtitle = paste0("Sex: p ", ifelse(p2[1] < 0.001, "< 0.001", paste("=", pfmt(p2[1]))),
+                         ";  Smoker: p ", ifelse(p2[2] < 0.001, "< 0.001", paste("=", pfmt(p2[2]))),
+                         ";  Interaction: p ", ifelse(p2[3] < 0.001, "< 0.001", paste("=", pfmt(p2[3])))),
+       y = "Mean lung capacity (L), with standard error")
+```
+
+Both **sex** (p `r pfmt(p2[1])`) and **smoking** (p `r pfmt(p2[2])`) have an effect on lung capacity. The interaction is **`r sig(p2[3])`** (p `r pfmt(p2[3])`): `r ifelse(p2[3] < 0.05, "smoking harms men and women differently.", "smoking lowers lung capacity by about the same amount in men and in women, so the two lines are parallel.")` `r ifelse(p2[3] < 0.05, "Because the lines are not parallel, we must describe the effect of smoking separately for men and for women.", "Because the lines are parallel, we can describe the two effects separately.")`
+
+A second look: does the zone effect depend on sex?
+
+```{r two-way-zone}
+aov3 <- aov(Lung_Capacity_L ~ Zone * Sex, data = d)
+s3 <- summary(aov3)[[1]]; rownames(s3) <- trimws(rownames(s3))
+s3
+p3 <- s3[["Pr(>F)"]][1:3]
+```
+
+Zone (p `r pfmt(p3[1])`) and sex (p `r pfmt(p3[2])`) both matter, and the zone x sex interaction is **`r sig(p3[3])`** (p `r pfmt(p3[3])`). `r ifelse(p3[3] < 0.05, "The zone effect is different for men and women.", "The zone effect is the same for men and women: dust hurts both sexes alike.")`
+
+# Did anything change over time?
+
+The survey ran from `r format(min(d$Survey_Date), "%d %B")` to `r format(max(d$Survey_Date), "%d %B %Y")`. We check whether the months differ.
+
+```{r time}
+table(d$Month)
+month_means <- aggregate(cbind(PM25, Cough_Days, Lung_Capacity_L) ~ Month, data = d, FUN = mean)
+knitr::kable(month_means, digits = 2)
+
+kw_month <- kruskal.test(PM25 ~ Month, data = d)
+p_month_lung <- summary(aov(Lung_Capacity_L ~ Month, data = d))[[1]][["Pr(>F)"]][1]
+
+ggplot(d, aes(Month, PM25, group = 1)) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1, colour = "steelblue") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.1) +
+  stat_summary(fun = mean, geom = "point", size = 3, colour = "steelblue") +
+  labs(title = "Average fine dust by survey month", y = "Mean PM2.5, with standard error")
+```
+
+Dust levels are `r ifelse(kw_month$p.value < 0.05, "different", "similar")` across months (Kruskal-Wallis p = `r pfmt(kw_month$p.value)`), and so is lung capacity (ANOVA p = `r pfmt(p_month_lung)`). The survey months are `r ifelse(kw_month$p.value < 0.05 | p_month_lung < 0.05, "not completely comparable, so keep this in mind", "comparable, so the survey date is not a worry for the rest of the analysis")`. A time effect would need a longer study.
+
+# Models that combine several variables
+
+Tests compare two things at a time. Real life is tangled: lung capacity depends on dust, age, sex and smoking all at once. **Regression** looks at one variable while holding the others fixed.
+
+## Linear regression: what explains lung capacity?
+
+The outcome is a number (`Lung_Capacity_L`), so we use `lm()`. Each coefficient is the change in lung capacity for a 1-unit increase in that variable, **with all other variables held constant**.
+
+```{r lm-simple}
+m_simple <- lm(Lung_Capacity_L ~ PM25, data = d)       # dust alone
+summary(m_simple)$coefficients
+```
+
+```{r lm-multiple}
+m_lin <- lm(Lung_Capacity_L ~ PM25 + Age + Sex + Smoker + BMI, data = d)
+sm <- summary(m_lin)
+sm
+
+coef_table <- cbind(Estimate = coef(m_lin), confint(m_lin), p = sm$coefficients[, 4])
+coef_show <- as.data.frame(round(coef_table, 4))
+coef_show$p <- pfmt(coef_table[, "p"])
+knitr::kable(coef_show)
+```
+
+**Reading the table.**
+
+- **Dust:** each extra 10 micrograms per cubic metre of PM2.5 lowers lung capacity by about **`r f2(abs(coef(m_lin)["PM25"]) * 10)` L**, after adjusting for age, sex, smoking and BMI (p `r pfmt(sm$coefficients["PM25", 4])`).
+- **Age:** each extra year lowers lung capacity by about `r sprintf("%.3f", abs(coef(m_lin)["Age"]))` L (p `r pfmt(sm$coefficients["Age", 4])`).
+- **Sex:** men have about `r f2(coef(m_lin)["SexMale"])` L more than women with the same age, dust and smoking (p `r pfmt(sm$coefficients["SexMale", 4])`).
+- **Smoking:** smokers have about `r f2(abs(coef(m_lin)["SmokerYes"]))` L less (p `r pfmt(sm$coefficients["SmokerYes", 4])`).
+- **BMI:** `r sig(sm$coefficients["BMI", 4])` (p `r pfmt(sm$coefficients["BMI", 4])`).
+- **Model fit:** R-squared = `r f2(sm$r.squared)` and adjusted R-squared = `r f2(sm$adj.r.squared)`: together these variables explain about **`r round(100 * sm$adj.r.squared)`%** of the differences in lung capacity. The typical prediction error is `r f2(sigma(m_lin))` L.
+
+**Confounding in action.** The simple slope for dust was `r sprintf("%.4f", coef(m_simple)["PM25"])` and the adjusted slope is `r sprintf("%.4f", coef(m_lin)["PM25"])`. `r ifelse(abs(coef(m_lin)["PM25"] - coef(m_simple)["PM25"]) < 0.0005, "They are close, so the dust effect stays after adjusting for the other variables.", "Adjusting changed the estimate, which shows that the other variables were mixed up with dust.")`
+
+**Checking the model.** Residuals should have no pattern (left plot) and be roughly normal (right plot).
+
+```{r lm-diagnostics, fig.width=9, fig.height=4}
+par(mfrow = c(1, 2))
+plot(m_lin, which = 1)      # residuals vs fitted values: should look like a random cloud
+plot(m_lin, which = 2)      # QQ plot of residuals: should follow the line
+par(mfrow = c(1, 1))
+```
+
+The residual plot shows a random cloud around zero and the QQ plot follows the line, so the model assumptions are acceptable.
+
+## Logistic regression: what predicts respiratory illness?
+
+The outcome is Yes / No, so we use `glm()` with `family = binomial`. The results are **odds ratios** (OR): OR above 1 means higher odds of illness, below 1 means lower odds, and 1 means no effect. We express dust in steps of 10 micrograms so the numbers are easy to read.
+
+```{r logistic}
+m_log <- glm(Respiratory_Illness ~ I(PM25 / 10) + Smoker + Age + Sex, data = d, family = binomial)
+summary(m_log)
+
+or_tab <- exp(cbind(OR = coef(m_log), confint.default(m_log)))[-1, ]    # drop the intercept
+rownames(or_tab) <- c("PM25 (per +10)", "Smoker: Yes vs No", "Age (per +1 year)", "Sex: Male vs Female")
+or_df <- data.frame(Predictor = rownames(or_tab), or_tab, p = pfmt(summary(m_log)$coefficients[-1, 4]),
+                    row.names = NULL)
+names(or_df)[2:4] <- c("OR", "Lower_95", "Upper_95")
+knitr::kable(or_df, digits = 2)
+```
+
+```{r logistic-plot, fig.height=3.8}
+or_df$Predictor <- factor(or_df$Predictor, levels = rev(or_df$Predictor))
+ggplot(or_df, aes(OR, Predictor)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey40") +
+  geom_errorbarh(aes(xmin = Lower_95, xmax = Upper_95), height = 0.2) +
+  geom_point(size = 3, colour = "steelblue") +
+  scale_x_log10() +
+  labs(title = "Odds ratios for respiratory illness", x = "Odds ratio (log scale, 95% CI)", y = NULL)
+```
+
+**Interpretation.**
+
+- Each extra 10 micrograms of PM2.5 raises the odds of illness by about **`r round(100 * (or_tab[1, 1] - 1))`%** (OR = `r f2(or_tab[1, 1])`, p `r pfmt(summary(m_log)$coefficients[2, 4])`).
+- Smokers have **`r f2(or_tab[2, 1])` times** the odds of illness of non-smokers (p `r pfmt(summary(m_log)$coefficients[3, 4])`), even after adjusting for dust, age and sex.
+- Age: `r sig(summary(m_log)$coefficients[4, 4])` (OR = `r f2(or_tab[3, 1])`, p `r pfmt(summary(m_log)$coefficients[4, 4])`). Sex: `r sig(summary(m_log)$coefficients[5, 4])` (OR = `r f2(or_tab[4, 1])`, p `r pfmt(summary(m_log)$coefficients[5, 4])`).
+
+**How good are the predictions?** We use the area under the ROC curve (AUC): 0.5 = guessing, 1 = perfect.
+
+```{r logistic-fit}
+d$p_hat <- predict(m_log, type = "response")            # predicted probability of illness
+y <- d$Respiratory_Illness == "Yes"
+n1 <- sum(y); n0 <- sum(!y)
+auc <- (sum(rank(d$p_hat)[y]) - n1 * (n1 + 1) / 2) / (n1 * n0)    # AUC from ranks
+
+pred_class <- factor(ifelse(d$p_hat > 0.5, "Yes", "No"), levels = c("No", "Yes"))
+conf <- table(Predicted = pred_class, Observed = d$Respiratory_Illness)
+conf
+accuracy <- sum(diag(conf)) / sum(conf)
+baseline <- max(prop.table(table(d$Respiratory_Illness)))   # always guessing "No"
+```
+
+The AUC is **`r f2(auc)`**, which means `r ifelse(auc >= 0.7, "the model separates ill from healthy people reasonably well", "the model is only a little better than guessing")`. At a cut-off of 0.5 the accuracy is `r round(100 * accuracy, 1)`%, and always guessing "No" would give `r round(100 * baseline, 1)`%. Accuracy alone is a weak measure when one group is much bigger, and that is why we look at the AUC.
+
+```{r logistic-curve}
+newdat <- expand.grid(PM25 = seq(10, 300, length.out = 100), Smoker = c("No", "Yes"),
+                      Age = mean(d$Age), Sex = "Female")
+newdat$Smoker <- factor(newdat$Smoker, levels = c("No", "Yes"))
+newdat$Sex    <- factor(newdat$Sex, levels = c("Female", "Male"))
+newdat$prob   <- predict(m_log, newdat, type = "response")
+
+ggplot(newdat, aes(PM25, prob, colour = Smoker)) +
+  geom_line(linewidth = 1.2) +
+  scale_colour_manual(values = c(No = "steelblue", Yes = "firebrick")) +
+  labs(title = "Predicted chance of respiratory illness",
+       subtitle = "For a woman of average age",
+       x = "PM2.5 (micrograms per cubic metre)", y = "Predicted probability of illness")
+```
+
+## Poisson regression: what explains the number of cough days?
+
+`Cough_Days` is a **count** (0, 1, 2, ...), so we use `glm()` with `family = poisson`. The results are **rate ratios**: a rate ratio of 1.10 means 10% more cough days.
+
+```{r poisson}
+m_pois <- glm(Cough_Days ~ I(PM25 / 10) + Smoker, data = d, family = poisson)
+rr <- exp(cbind(RR = coef(m_pois), confint.default(m_pois)))[-1, ]
+rownames(rr) <- c("PM25 (per +10)", "Smoker: Yes vs No")
+knitr::kable(round(rr, 2))
+dispersion <- deviance(m_pois) / df.residual(m_pois)
+```
+
+Each extra 10 micrograms of PM2.5 means about **`r round(100 * (rr[1, 1] - 1))`% more** cough days, and smokers have about **`r f2(rr[2, 1])` times** as many cough days as non-smokers (p for both `r pfmt(max(summary(m_pois)$coefficients[-1, 4]))`). The dispersion ratio is `r f2(dispersion)`. A value near 1 means the Poisson model fits well. `r ifelse(dispersion > 1.5, "This value is much larger than 1, so the counts vary more than Poisson expects, the p-values may be too small and a quasi-Poisson model is safer.", "This value is close to 1, so the Poisson model is a good choice here.")`
+
+# Summary of the findings
+
+```{r summary-table}
+summary_tab <- data.frame(
+  Question = c(
+    "Do men and women sleep different hours?",
+    "Do smokers have different lung capacity?",
+    "Does lung capacity differ between zones?",
+    "Does dust (PM2.5) differ between zones?",
+    "Does exercise change resting heart rate?",
+    "Is smoking linked to respiratory illness?",
+    "Is zone linked to respiratory illness?",
+    "Is sex linked to smoking?",
+    "Are dust and lung capacity correlated?",
+    "Does the zone effect depend on sex?"),
+  Test = c("Welch t-test", "Welch t-test", "One-way ANOVA", "Kruskal-Wallis", "One-way ANOVA",
+           "Chi-square", "Chi-square", "Chi-square", "Pearson correlation", "Two-way ANOVA interaction"),
+  p = c(two_group_tests$p[1], two_group_tests$p[3], p_zone, kw_pm$p.value, p_hr,
+        chi_si$p.value, chi_zi$p.value, chi_ss$p.value, ct_pm$p.value, p3[3]))
+summary_tab$Result <- ifelse(summary_tab$p < 0.05, "Significant", "Not significant")
+summary_tab$p <- pfmt(summary_tab$p)
+knitr::kable(summary_tab)
+```
+
+**Key findings**
+
+1. **Dust and lungs.** More fine dust goes with smaller lung capacity (r = `r f2(ct_pm$estimate)`), and the link remains after adjusting for age, sex, smoking and BMI (about `r f2(abs(coef(m_lin)["PM25"]) * 10)` L less per +10 micrograms of PM2.5).
+2. **Place matters.** The `r names(which.min(zone_means))` zone has the highest dust and the lowest average lung capacity, and the `r names(which.max(zone_means))` zone the highest lung capacity.
+3. **Smoking harms in several ways.** After adjusting for sex, smokers have smaller lungs (about `r f2(abs(coef(m_lin)["SmokerYes"]))` L), more cough days (`r f2(rr[2, 1])` times) and `r f2(or_tab[2, 1])` times the odds of respiratory illness.
+4. **Illness and dust.** Each extra 10 micrograms of PM2.5 raises the odds of respiratory illness by about `r round(100 * (or_tab[1, 1] - 1))`%.
+5. **Things that do not matter.** Men and women sleep the same number of hours. Not every comparison gives a significant result, and that is also a finding.
+6. **Confounding.** Men smoke more than women, so sex and smoking must be studied together. Regression separates them.
+
+**Limits of this analysis.** This is an observational survey, so we can show that variables are *linked*, but we cannot prove that dust *causes* smaller lungs. Other factors that were not measured (income, job, indoor air) could play a role. Many tests were run, so a few borderline p-values could be false alarms.
+
+# Practice tasks
+
+1. Repeat the Welch t-test for `Resting_HR` by `Sex` and report the effect size.
+2. Find which `BMI_Category` has the highest respiratory illness rate, and test it with a chi-square test.
+3. Draw a box plot of `Cough_Days` by `Mask_Use`. Do mask-wearers cough less? Test it with Kruskal-Wallis.
+4. Add `Exercise_Level` to the linear model for lung capacity. Does R-squared improve?
+5. Use `Age_Group` instead of `Age` in the logistic model. What do the odds ratios say?
+
+```{r session}
+sessionInfo()
+```
