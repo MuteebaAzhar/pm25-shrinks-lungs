@@ -81,10 +81,3 @@ Tested with R 4.x. The core analysis uses base R (`stats`) plus `ggplot2` for fi
 
 Reproducible reporting (R Markdown), exploratory data analysis, statistical test selection and assumption checking, effect sizes, confounding and adjustment, generalised linear models (logistic, Poisson), model evaluation (ROC/AUC, dispersion), and clear scientific communication.
 
-## Author
-
-**Muhammad Imran Afzal** – MS Biotechnology, University of the Punjab, Lahore. Biostatistics and bioinformatics.
-
-## License
-
-MIT (code); data are synthetic and free to use.
